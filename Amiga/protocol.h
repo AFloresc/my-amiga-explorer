@@ -1,0 +1,38 @@
+/*
+ * protocol.h
+ *
+ *  Created on: May 10, 2021
+ *      Author: rony
+ */
+
+#ifndef AMIGA_PROTOCOL_H_
+#define AMIGA_PROTOCOL_H_
+
+#include "../protocolTypes.h"
+
+#ifdef __GNUC__
+#include <sys/unistd.h>
+#include <proto/bsdsocket.h>
+#endif
+
+#ifdef __VBCC__
+
+#endif
+
+#define MASTER_MSGPORT_NAME "AEServerMaster"
+
+typedef int SOCKET;
+
+//Error codes for the socket
+#define MAGIC_TOKEN_MISSING -1
+#define INVALID_MESSAGE_TYPE -2
+#define INVALID_MESSAGE_SIZE -3
+#define SOCKET_ERROR -4
+#define TIMEOUT -5
+
+int sendMessage( struct Library *SocketBase, SOCKET clientSocket, ProtocolMessage_t *message );
+int getMessage( struct Library *SocketBase, SOCKET socket, ProtocolMessage_t *message, unsigned int maxMessageLength );
+//int getMessageNB( struct Library *SocketBase, SOCKET clientSocket, ProtocolMessage_t *message, unsigned int maxMessageLength, fd_set *fdset, struct timeval timeout );
+
+#endif /* AMIGA_PROTOCOL_H_ */
+
