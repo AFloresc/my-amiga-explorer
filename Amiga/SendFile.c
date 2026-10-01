@@ -52,8 +52,22 @@ static ProtocolMessage_Ack_t *g_AcknowledgeMessage = NULL;
 static ProtocolMessage_StartOfFileSend_t *g_StartOfFilesendMessage = NULL;
 #endif
 
+#define FNV_PRIME_32        16777619UL
+#define FNV_OFFSET_BASIS_32 2166136261UL
 
+ULONG CalculateFNV1a32(const UBYTE *data, ULONG length)
+{
+    ULONG hash = FNV_OFFSET_BASIS_32;
+    ULONG i;
 
+    for (i = 0; i < length; i++)
+    {
+        hash ^= (ULONG)data[i];
+        hash *= FNV_PRIME_32;
+    }
+
+    return hash;
+}
 
 ProtocolMessage_Ack_t *requestFileSend( char *path, FileSendContext_t *context )
 {
@@ -252,9 +266,25 @@ BOOL SendFile(LONG socketFd, STRPTR localFilePath, unsigned int byteOffset)
         return FALSE;
     }
 
-    // Soporte para Seek (Resume) al enviar un archivo:
+    // Obtener el tamaño total del archivo usando Seek al final
+    LONG fileSize = Seek(fileHandle, 0, OFFSET_END);
+    if (fileSize == -1)
+    {
+        dbglog("[SendFile] Error al obtener el tamaño del archivo '%s'\n", localFilePath);
+        Close(fileHandle);
+        return FALSE;
+    }
+
+    // Rama de validación previa (Offset Check)
     if (byteOffset > 0)
     {
+        if ((unsigned int)fileSize <= byteOffset)
+        {
+            dbglog("[SendFile] Advertencia: El offset solicitado (%u) es mayor o igual al tamaño del archivo (%ld).\n", byteOffset, fileSize);
+            Close(fileHandle);
+            return TRUE; 
+        }
+
         LONG seekResult = Seek(fileHandle, (LONG)byteOffset, OFFSET_BEGINNING);
         if (seekResult == -1)
         {
@@ -262,7 +292,11 @@ BOOL SendFile(LONG socketFd, STRPTR localFilePath, unsigned int byteOffset)
             Close(fileHandle);
             return FALSE;
         }
-        dbglog("[SendFile] Envío reanudado desde el offset: %u\n", byteOffset);
+        dbglog("[SendFile] Envío reanudado desde el offset: %u (Tamaño total: %ld)\n", byteOffset, fileSize);
+    }
+    else
+    {
+        Seek(fileHandle, 0, OFFSET_BEGINNING);
     }
 
     UBYTE buffer[FILE_CHUNK_SIZE];
@@ -292,6 +326,12 @@ BOOL SendFile(LONG socketFd, STRPTR localFilePath, unsigned int byteOffset)
                 }
             }
         }
+
+        /* Calcular el Checksum FNV-1a para el bloque actual */
+        ULONG blockChecksum = CalculateFNV1a32(buffer, bytesRead);
+        #if DBGOUT
+        dbglog("[SendFile] Bloque procesado - Bytes: %ld, Checksum FNV-1a: 0x%08lx\n", bytesRead, blockChecksum);
+        #endif
 
         /* Enviar el bloque por el socket */
         if (send(socketFd, (char *)buffer, bytesRead, 0) != bytesRead)
