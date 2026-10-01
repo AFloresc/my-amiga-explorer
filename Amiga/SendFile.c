@@ -11,6 +11,10 @@
 
 #include "protocolTypes.h"
 #include "protocol.h"
+#include "SendFile.h"
+
+#include <sys/socket.h>
+#include <sys/select.h>
 
 #include <proto/exec.h>
 #include <proto/dos.h>
@@ -275,43 +279,42 @@ BOOL SendFile(LONG socketFd, STRPTR localFilePath, unsigned int byteOffset)
         return FALSE;
     }
 
-    // Rama de validación previa (Offset Check)
+    // Gestión del offset para reanudación
     if (byteOffset > 0)
     {
         if ((unsigned int)fileSize <= byteOffset)
         {
-            dbglog("[SendFile] Advertencia: El offset solicitado (%u) es mayor o igual al tamaño del archivo (%ld).\n", byteOffset, fileSize);
             Close(fileHandle);
             return TRUE; 
         }
-
-        LONG seekResult = Seek(fileHandle, (LONG)byteOffset, OFFSET_BEGINNING);
-        if (seekResult == -1)
-        {
-            dbglog("[SendFile] Error al posicionar Seek en el offset %u\n", byteOffset);
-            Close(fileHandle);
-            return FALSE;
-        }
-        dbglog("[SendFile] Envío reanudado desde el offset: %u (Tamaño total: %ld)\n", byteOffset, fileSize);
+        Seek(fileHandle, (LONG)byteOffset, OFFSET_BEGINNING);
     }
     else
     {
         Seek(fileHandle, 0, OFFSET_BEGINNING);
     }
 
-    UBYTE buffer[FILE_CHUNK_SIZE];
+    // Reservar memoria para la estructura completa del mensaje
+    ProtocolMessage_FileChunk_t *chunkMsg = AllocVec(sizeof(ProtocolMessage_FileChunk_t), MEMF_FAST | MEMF_CLEAR);
+    if (!chunkMsg)
+    {
+        Close(fileHandle);
+        return FALSE;
+    }
+
+    ULONG currentChunkIndex = 0;
     LONG bytesRead = 0;
     BOOL aborted = FALSE;
 
-    while ((bytesRead = Read(fileHandle, buffer, sizeof(buffer))) > 0)
+    while ((bytesRead = Read(fileHandle, chunkMsg->chunk, FILE_CHUNK_SIZE)) > 0)
     {
-        /* Comprobar si el cliente solicita cancelar la operación */
+        /* Comprobación de cancelación por parte del cliente */
         struct timeval tv = { 0, 0 };
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(socketFd, &readfds);
 
-        if (waitselect(socketFd + 1, &readfds, NULL, NULL, &tv, NULL) > 0)
+        if (WaitSelect(socketFd + 1, &readfds, NULL, NULL, &tv, NULL) > 0)
         {
             ProtocolMessage_t header;
             if (recv(socketFd, (char *)&header, sizeof(ProtocolMessage_t), MSG_PEEK) >= (LONG)sizeof(ProtocolMessage_t))
@@ -327,14 +330,22 @@ BOOL SendFile(LONG socketFd, STRPTR localFilePath, unsigned int byteOffset)
             }
         }
 
-        /* Calcular el Checksum FNV-1a para el bloque actual */
-        ULONG blockChecksum = CalculateFNV1a32(buffer, bytesRead);
+        /* Rellenar cabecera y metadatos del chunk */
+        chunkMsg->header.token = MAGIC_TOKEN;
+        chunkMsg->header.type = PMT_FILE_CHUNK;
+        chunkMsg->header.length = sizeof(ProtocolMessage_FileChunk_t);
+        chunkMsg->chunkNumber = currentChunkIndex++;
+        chunkMsg->bytesContained = bytesRead;
+
+        /* Calcular el Checksum FNV-1a */
+        chunkMsg->checksum = CalculateFNV1a32((UBYTE *)chunkMsg->chunk, bytesRead);
+
         #if DBGOUT
-        dbglog("[SendFile] Bloque procesado - Bytes: %ld, Checksum FNV-1a: 0x%08lx\n", bytesRead, blockChecksum);
+        dbglog("[SendFile] Chunk %lu - Bytes: %ld, Checksum FNV-1a: 0x%08lx\n", chunkMsg->chunkNumber, bytesRead, chunkMsg->checksum);
         #endif
 
-        /* Enviar el bloque por el socket */
-        if (send(socketFd, (char *)buffer, bytesRead, 0) != bytesRead)
+        /* Enviar la estructura entera por el socket */
+        if (send(socketFd, (char *)chunkMsg, sizeof(ProtocolMessage_FileChunk_t), 0) != sizeof(ProtocolMessage_FileChunk_t))
         {
             aborted = TRUE;
             break;
@@ -342,6 +353,8 @@ BOOL SendFile(LONG socketFd, STRPTR localFilePath, unsigned int byteOffset)
     }
 
     Close(fileHandle);
+    FreeVec(chunkMsg);
+    
 
     if (aborted)
     {

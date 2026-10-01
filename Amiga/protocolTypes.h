@@ -192,6 +192,7 @@ typedef struct
     ProtocolMessage_t header;
     unsigned int chunkNumber;
     unsigned int bytesContained;
+	unsigned int checksum;
     char chunk[ FILE_CHUNK_SIZE ];
 } ProtocolMessage_FileChunk_t;
 
@@ -247,6 +248,7 @@ typedef struct
     ProtocolMessage_t header;
     unsigned short oldNameSize;
     unsigned short newNameSize;
+	unsigned int checksum;
     char filePaths[1];      //The old name shall be encoded first, then a NULL, then the new name and finally a NULL;
 } ProtocolMessage_RenamePath_t;
 

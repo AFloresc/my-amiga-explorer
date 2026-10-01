@@ -8,7 +8,7 @@
 #ifndef AMIGA_PROTOCOL_H_
 #define AMIGA_PROTOCOL_H_
 
-#include "../protocolTypes.h"
+#include "protocolTypes.h"
 
 #ifdef __GNUC__
 #include <sys/unistd.h>

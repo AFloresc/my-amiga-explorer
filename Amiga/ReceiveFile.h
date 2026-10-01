@@ -10,7 +10,7 @@
 
 #include "protocolTypes.h"
 
-ProtocolMessage_Ack_t *requestFileReceive( char *path );
+ProtocolMessage_Ack_t *requestFileReceive( char *path, unsigned int byteOffset );
 
 void putStartOfFileReceive( ProtocolMessage_StartOfFileSend_t *startOfFilesendMessage );
 
