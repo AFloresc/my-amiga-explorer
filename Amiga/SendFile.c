@@ -5,8 +5,16 @@
  *      Author: rony
  */
 
-#include "SendFile.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
+#include "protocolTypes.h"
+#include "protocol.h"
+
+#include <proto/exec.h>
+#include <proto/dos.h>
+#include <proto/bsdsocket.h>
 #define DBGOUT 0
 
 
@@ -49,188 +57,264 @@ static ProtocolMessage_StartOfFileSend_t *g_StartOfFilesendMessage = NULL;
 
 ProtocolMessage_Ack_t *requestFileSend( char *path, FileSendContext_t *context )
 {
-	//Valid context?
-	if( context == NULL )
-	{
-		//We are currently doing a file send
-		dbglog( "Invalid context for file send!\n" );
-		return NULL;
-	}
+    //Valid context?
+    if( context == NULL )
+    {
+        //We are currently doing a file send
+        dbglog( "Invalid context for file send!\n" );
+        return NULL;
+    }
 
-	//Set up the message
-	context->acknowledgeMessage->header.token = MAGIC_TOKEN;
-	context->acknowledgeMessage->header.length = sizeof( ProtocolMessage_Ack_t );
-	context->acknowledgeMessage->header.type = PMT_ACK;
+    //Set up the message
+    context->acknowledgeMessage->header.token = MAGIC_TOKEN;
+    context->acknowledgeMessage->header.length = sizeof( ProtocolMessage_Ack_t );
+    context->acknowledgeMessage->header.type = PMT_ACK;
 
-	//First check if this file exists
-	dbglog( "[requestFileSend] Checking for the existance of '%s'.\n", path );
-	dbglog( "[requestFileSend] Current g_AcknowledgeMessage address 0x%08x.\n", context->acknowledgeMessage );
-	context->fileLock = Lock( path, ACCESS_READ );
-	if( context->fileLock == (BPTR)NULL )
-	{
-		//We couldn't get a file lock
-		context->acknowledgeMessage->response = 0;
-		dbglog( "[requestFileSend] File '%s' is unreadable or doesn't exist.\n", path );
-	}else
-	{
-		context->acknowledgeMessage->response = 1;
-		dbglog( "[requestFileSend] CFile '%s' is readable.\n", path );
-		UnLock( context->fileLock );
-		context->fileLock = (BPTR)NULL;
-	}
+    //First check if this file exists
+    dbglog( "[requestFileSend] Checking for the existance of '%s'.\n", path );
+    dbglog( "[requestFileSend] Current g_AcknowledgeMessage address 0x%08x.\n", (int)context->acknowledgeMessage );
+    context->fileLock = Lock( path, ACCESS_READ );
+    if( context->fileLock == (BPTR)NULL )
+    {
+        //We couldn't get a file lock
+        context->acknowledgeMessage->response = 0;
+        dbglog( "[requestFileSend] File '%s' is unreadable or doesn't exist.\n", path );
+    }else
+    {
+        context->acknowledgeMessage->response = 1;
+        dbglog( "[requestFileSend] File '%s' is readable.\n", path );
+        UnLock( context->fileLock );
+        context->fileLock = (BPTR)NULL;
+    }
 
-	dbglog( "[requestFileSend] Acknowledge response set to %d.\n", context->acknowledgeMessage->response );
+    dbglog( "[requestFileSend] Acknowledge response set to %d.\n", context->acknowledgeMessage->response );
 
-	return context->acknowledgeMessage;
+    return context->acknowledgeMessage;
 }
 
 ProtocolMessage_StartOfFileSend_t *getStartOfFileSend( char *path, FileSendContext_t *context )
 {
-	//Do we have a valid context?
-	if( context == NULL )
-	{
-		dbglog( "Invalid context.  Shame the user will never know.\n" );
-		return NULL;
-	}
+    //Do we have a valid context?
+    if( context == NULL )
+    {
+        dbglog( "Invalid context.  Shame the user will never know.\n" );
+        return NULL;
+    }
 
-	//Reset the variable parts of the message
-	strncpy( context->startOfFilesendMessage->filePath, path, MAX_FILEPATH_LENGTH );
-	context->startOfFilesendMessage->fileSize = 0;
-	context->startOfFilesendMessage->numberOfFileChunks = 0;
+    //Reset the variable parts of the message
+    strncpy( context->startOfFilesendMessage->filePath, path, MAX_FILEPATH_LENGTH );
+    context->startOfFilesendMessage->fileSize = 0;
+    context->startOfFilesendMessage->numberOfFileChunks = 0;
+    context->startOfFilesendMessage->byteOffset = 0;
 
-	//Let's find out how big the file is first
-	context->fileHandle = Open( path, MODE_OLDFILE );
-	if( context->fileHandle == (BPTR)NULL )
-	{
-		dbglog( "[getStartOfFile] Failed to open file '%s' for reading.\n", path );
-		return context->startOfFilesendMessage;
-	}
+    //Let's find out how big the file is first
+    context->fileHandle = Open( path, MODE_OLDFILE );
+    if( context->fileHandle == (BPTR)NULL )
+    {
+        dbglog( "[getStartOfFile] Failed to open file '%s' for reading.\n", path );
+        return context->startOfFilesendMessage;
+    }
 
-	//Examine the file in question
-	if( !ExamineFH( context->fileHandle, &context->fileInfoBlock ) )
-	{
-		dbglog( "[getStartOfFile] Failed to examine file '%s' for reading.\n", path );
-		return context->startOfFilesendMessage;
-	}
+    //Examine the file in question
+    if( !ExamineFH( context->fileHandle, &context->fileInfoBlock ) )
+    {
+        dbglog( "[getStartOfFile] Failed to examine file '%s' for reading.\n", path );
+        Close( context->fileHandle );
+        context->fileHandle = (BPTR)NULL;
+        return context->startOfFilesendMessage;
+    }
 
-	//So how many blocks do we send?
-	context->totalChunks = context->fileInfoBlock.fib_Size / FILE_CHUNK_SIZE + ( context->fileInfoBlock.fib_Size%FILE_CHUNK_SIZE > 0 ? 1 : 0);
-	context->currentChunk = 0;
+    //So how many blocks do we send?
+    context->totalChunks = context->fileInfoBlock.fib_Size / FILE_CHUNK_SIZE + ( context->fileInfoBlock.fib_Size%FILE_CHUNK_SIZE > 0 ? 1 : 0);
+    context->currentChunk = 0;
 
+    context->startOfFilesendMessage->fileSize = context->fileInfoBlock.fib_Size;
+    context->startOfFilesendMessage->numberOfFileChunks = context->totalChunks;
+    context->startOfFilesendMessage->byteOffset = 0;
 
-	context->startOfFilesendMessage->fileSize = context->fileInfoBlock.fib_Size;
-	context->startOfFilesendMessage->numberOfFileChunks = context->totalChunks;
-	dbglog( "[getStartOfFile] Filesize: %d.\n", context->startOfFilesendMessage->fileSize );
-	dbglog( "[getStartOfFile] Chunks: %d.\n", context->startOfFilesendMessage->numberOfFileChunks );
-	dbglog( "[getStartOfFile] StartOfFile Message address: 0x%08x\n", (int)context->startOfFilesendMessage );
-	dbglog( "[getStartOfFile] StartOfFile Message token: 0x%08x\n", context->startOfFilesendMessage->header.token );
-	dbglog( "[getStartOfFile] StartOfFile Message type: 0x%08x\n", context->startOfFilesendMessage->header.type );
-	dbglog( "[getStartOfFile] StartOfFile Message length: 0x%08x\n", context->startOfFilesendMessage->header.length );
+    dbglog( "[getStartOfFile] Filesize: %d.\n", context->startOfFilesendMessage->fileSize );
+    dbglog( "[getStartOfFile] Chunks: %d.\n", context->startOfFilesendMessage->numberOfFileChunks );
 
-	//We are done here
-	return context->startOfFilesendMessage;
+    //We are done here
+    return context->startOfFilesendMessage;
 }
 
 ProtocolMessage_FileChunk_t *getNextFileSendChunk( char *path, FileSendContext_t *context )
 {
-	int bytesRead = 0;
+    int bytesRead = 0;
 
-	//Valid context?
-	if( context == NULL )
-	{
-		dbglog( "Invalid context.  Shame the user will never know.\n" );
-		return NULL;
-	}
+    //Valid context?
+    if( context == NULL )
+    {
+        dbglog( "Invalid context.  Shame the user will never know.\n" );
+        return NULL;
+    }
 
-	//Clear out the current message
-	memset( context->fileChunkMessage->chunk,0, FILE_CHUNK_SIZE );
+    //Clear out the current message
+    memset( context->fileChunkMessage->chunk, 0, FILE_CHUNK_SIZE );
 
-	//Read the next file data
-	bytesRead = Read( context->fileHandle, context->fileChunkMessage->chunk, FILE_CHUNK_SIZE );
-	if( bytesRead < 0 )
-	{
-		//What should we do here?
-		dbglog( "[getNextFileSendChunk] Reading of file '%s' failed with error code: %d.\n", path, bytesRead );
-		Close( context->fileHandle );
-		context->fileHandle = (BPTR)NULL;
-		return NULL;
-	}
-	if( bytesRead == 0 )
-	{
-		//End-of-file
-		dbglog( "[getNextFileSendChunk] Reached the end of file '%s'.\n", path );
-		Close( context->fileHandle );
-		context->fileHandle = (BPTR)NULL;
-		return NULL;
-	}
-	dbglog( "[getNextFileSendChunk] Read %d bytes from file '%s'.\n", bytesRead, path );
+    //Read the next file data
+    bytesRead = Read( context->fileHandle, context->fileChunkMessage->chunk, FILE_CHUNK_SIZE );
+    if( bytesRead < 0 )
+    {
+        dbglog( "[getNextFileSendChunk] Reading of file '%s' failed.\n", path );
+        Close( context->fileHandle );
+        context->fileHandle = (BPTR)NULL;
+        return NULL;
+    }
+    if( bytesRead == 0 )
+    {
+        //End-of-file
+        dbglog( "[getNextFileSendChunk] Reached the end of file '%s'.\n", path );
+        Close( context->fileHandle );
+        context->fileHandle = (BPTR)NULL;
+        return NULL;
+    }
+    dbglog( "[getNextFileSendChunk] Read %d bytes from file '%s'.\n", bytesRead, path );
 
-	//Update book keeping
-	context->totalBytesLeftToRead -= bytesRead;
-	context->totalBytesRead += bytesRead;
+    //Update book keeping
+    context->totalBytesLeftToRead -= bytesRead;
+    context->totalBytesRead += bytesRead;
 
-	//Update the chunk message
-	context->fileChunkMessage->bytesContained = bytesRead;
-	context->fileChunkMessage->chunkNumber = context->currentChunk++;
+    //Update the chunk message
+    context->fileChunkMessage->bytesContained = bytesRead;
+    context->fileChunkMessage->chunkNumber = context->currentChunk++;
 
-	//send
-	return context->fileChunkMessage;
+    //send
+    return context->fileChunkMessage;
 }
 
 void cleanupFileSend( FileSendContext_t *context )
 {
-	//Valid context?
-	if( context == NULL ) return;
+    //Valid context?
+    if( context == NULL ) return;
 
-	//Close any file we have open
-	if( context->fileHandle != (BPTR)NULL )
-	{
-		Close( context->fileHandle );
-		context->fileHandle = (BPTR)NULL;
-	}
+    //Close any file we have open
+    if( context->fileHandle != (BPTR)NULL )
+    {
+        Close( context->fileHandle );
+        context->fileHandle = (BPTR)NULL;
+    }
 
-	//clean up book keeping
-	context->totalBytesLeftToRead = 0;
-	context->totalBytesRead = 0;
-	context->currentChunk = 0;
-	context->totalChunks = 0;
+    //clean up book keeping
+    context->totalBytesLeftToRead = 0;
+    context->totalBytesRead = 0;
+    context->currentChunk = 0;
+    context->totalChunks = 0;
 }
 
 FileSendContext_t *allocateFileSendContext()
 {
-	FileSendContext_t *context = (FileSendContext_t*)AllocVec( sizeof( FileSendContext_t ), MEMF_CLEAR|MEMF_FAST );
+    FileSendContext_t *context = (FileSendContext_t*)AllocVec( sizeof( FileSendContext_t ), MEMF_CLEAR|MEMF_FAST );
+    if( context == NULL ) return NULL;
 
-	//Allocate the achknowledge message
-	context->acknowledgeMessage = AllocVec( sizeof( ProtocolMessage_Ack_t ), MEMF_FAST|MEMF_CLEAR );
-	context->acknowledgeMessage->header.token = MAGIC_TOKEN;
-	context->acknowledgeMessage->header.length = sizeof( ProtocolMessage_Ack_t );
-	context->acknowledgeMessage->header.type = PMT_ACK;
+    //Allocate the acknowledge message
+    context->acknowledgeMessage = AllocVec( sizeof( ProtocolMessage_Ack_t ), MEMF_FAST|MEMF_CLEAR );
+    context->acknowledgeMessage->header.token = MAGIC_TOKEN;
+    context->acknowledgeMessage->header.length = sizeof( ProtocolMessage_Ack_t );
+    context->acknowledgeMessage->header.type = PMT_ACK;
 
-	//Allocate the start of send message
-	context->startOfFilesendMessage = ( ProtocolMessage_StartOfFileSend_t* )AllocVec( MAX_MESSAGE_LENGTH , MEMF_FAST|MEMF_CLEAR ) + MAX_FILEPATH_LENGTH + 1;
-	context->startOfFilesendMessage->header.token = MAGIC_TOKEN;
-	context->startOfFilesendMessage->header.length = sizeof( ProtocolMessage_StartOfFileSend_t ) + MAX_FILEPATH_LENGTH + 1;
-	context->startOfFilesendMessage->header.type = PMT_START_OF_SEND_FILE;
+    //Allocate the start of send message
+    context->startOfFilesendMessage = ( ProtocolMessage_StartOfFileSend_t* )AllocVec( MAX_MESSAGE_LENGTH, MEMF_FAST|MEMF_CLEAR );
+    context->startOfFilesendMessage->header.token = MAGIC_TOKEN;
+    context->startOfFilesendMessage->header.length = sizeof( ProtocolMessage_StartOfFileSend_t );
+    context->startOfFilesendMessage->header.type = PMT_START_OF_SEND_FILE;
 
-	//Allocate the file chunk message
-	context->fileChunkMessage = AllocVec( sizeof( ProtocolMessage_FileChunk_t ), MEMF_FAST|MEMF_CLEAR );
-	context->fileChunkMessage->header.token = MAGIC_TOKEN;
-	context->fileChunkMessage->header.length = sizeof( ProtocolMessage_FileChunk_t );
-	context->fileChunkMessage->header.type = PMT_FILE_CHUNK;
+    //Allocate the file chunk message
+    context->fileChunkMessage = AllocVec( sizeof( ProtocolMessage_FileChunk_t ), MEMF_FAST|MEMF_CLEAR );
+    context->fileChunkMessage->header.token = MAGIC_TOKEN;
+    context->fileChunkMessage->header.length = sizeof( ProtocolMessage_FileChunk_t );
+    context->fileChunkMessage->header.type = PMT_FILE_CHUNK;
 
-	return context;
+    return context;
 }
 
 void freeFileSendContext( FileSendContext_t *context )
 {
-	//Is it a valid pointer?
-	if( context == NULL )	return;
+    //Is it a valid pointer?
+    if( context == NULL )  return;
 
-	//Make sure we have cleaned up after ourselves
-	cleanupFileSend( context );
+    //Make sure we have cleaned up after ourselves
+    cleanupFileSend( context );
 
-	//Free everything
-	FreeVec( context->acknowledgeMessage );
-	FreeVec( context->startOfFilesendMessage );
-	FreeVec( context->fileChunkMessage );
+    //Free everything
+    if( context->acknowledgeMessage ) FreeVec( context->acknowledgeMessage );
+    if( context->startOfFilesendMessage ) FreeVec( context->startOfFilesendMessage );
+    if( context->fileChunkMessage ) FreeVec( context->fileChunkMessage );
+    FreeVec( context );
+}
+
+BOOL SendFile(LONG socketFd, STRPTR localFilePath, unsigned int byteOffset)
+{
+    BPTR fileHandle = Open(localFilePath, MODE_OLDFILE);
+    if (!fileHandle)
+    {
+        return FALSE;
+    }
+
+    // Soporte para Seek (Resume) al enviar un archivo:
+    if (byteOffset > 0)
+    {
+        LONG seekResult = Seek(fileHandle, (LONG)byteOffset, OFFSET_BEGINNING);
+        if (seekResult == -1)
+        {
+            dbglog("[SendFile] Error al posicionar Seek en el offset %u\n", byteOffset);
+            Close(fileHandle);
+            return FALSE;
+        }
+        dbglog("[SendFile] Envío reanudado desde el offset: %u\n", byteOffset);
+    }
+
+    UBYTE buffer[FILE_CHUNK_SIZE];
+    LONG bytesRead = 0;
+    BOOL aborted = FALSE;
+
+    while ((bytesRead = Read(fileHandle, buffer, sizeof(buffer))) > 0)
+    {
+        /* Comprobar si el cliente solicita cancelar la operación */
+        struct timeval tv = { 0, 0 };
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(socketFd, &readfds);
+
+        if (waitselect(socketFd + 1, &readfds, NULL, NULL, &tv, NULL) > 0)
+        {
+            ProtocolMessage_t header;
+            if (recv(socketFd, (char *)&header, sizeof(ProtocolMessage_t), MSG_PEEK) >= (LONG)sizeof(ProtocolMessage_t))
+            {
+                ULONG msgType = header.type;
+                if (msgType == PMT_CANCEL_OPERATION || ntohl(msgType) == PMT_CANCEL_OPERATION)
+                {
+                    recv(socketFd, (char *)&header, sizeof(ProtocolMessage_t), 0);
+                    aborted = TRUE;
+                    dbglog("[SendFile] Transferencia cancelada por el cliente.\n");
+                    break;
+                }
+            }
+        }
+
+        /* Enviar el bloque por el socket */
+        if (send(socketFd, (char *)buffer, bytesRead, 0) != bytesRead)
+        {
+            aborted = TRUE;
+            break;
+        }
+    }
+
+    Close(fileHandle);
+
+    if (aborted)
+    {
+        ProtocolMessage_Ack_t ackMsg;
+        memset(&ackMsg, 0, sizeof(ackMsg));
+        ackMsg.header.token = MAGIC_TOKEN;
+        ackMsg.header.type = PMT_ACK;
+        ackMsg.header.length = sizeof(ProtocolMessage_Ack_t);
+        ackMsg.response = AT_NOK;
+
+        send(socketFd, (char *)&ackMsg, sizeof(ProtocolMessage_Ack_t), 0);
+        return FALSE;
+    }
+
+    return TRUE;
 }
