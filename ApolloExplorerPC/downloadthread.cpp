@@ -12,6 +12,22 @@
 #define UNLOCK locker.unlock()
 #define RELOCK locker.relock();
 
+// Función de cálculo FNV-1a de 32 bits optimizada con punteros para validar bloques en el cliente
+static inline quint32 calculateFNV1a32(const char *data, qint64 length)
+{
+    quint32 hash = 2166136261UL;
+    const quint32 prime = 16777619UL;
+    const char *ptr = data;
+    const char *end = data + length;
+
+    while (ptr < end) {
+        hash ^= static_cast<quint32>(static_cast<unsigned char>(*ptr++));
+        hash *= prime;
+    }
+
+    return hash;
+}
+
 DownloadThread::DownloadThread(QObject *parent) :
     QThread(parent),
     m_Mutex(),
@@ -278,64 +294,122 @@ void DownloadThread::onAcknowledgeSlot( quint8 responseCode )
 
 void DownloadThread::onStartOfFileSendSlot(quint64 fileSize, quint32 numberOfChunks, QString filename)
 {
-    DBGLOG << "Got the start-of-download message for " << filename << "with " << numberOfChunks << " chunks and filesize " << fileSize;
+    DBGLOG << "Got the start-of-download message for " << filename << " with " << numberOfChunks << " chunks and filesize " << fileSize;
 
-    //Special case.  File to be downloaded if zero bytes in size
+    // Special case. File to be downloaded if zero bytes in size
     if( fileSize == 0 && numberOfChunks == 0 )
     {
         DBGLOG << "File " << m_LocalFile.fileName() << " is zero bytes in size";
         cleanup();
         emit downloadCompletedSignal();
+        return;
     }
 
-    //Otherwise we are ok
+    // Otherwise we are ok
     m_FileSize = fileSize;
     m_FileChunks = numberOfChunks;
     m_CurrentChunk = 0;
 
-    //restart the operation timer
+    // Pre-alojar el espacio en el archivo local para evitar fragmentación y optimizar escrituras
+    if( m_LocalFile.isOpen() )
+    {
+        if( !m_LocalFile.resize( m_FileSize ) )
+        {
+            DBGLOG << "No se pudo pre-alojar el espacio en disco para el archivo: " << m_LocalFile.errorString();
+        }
+    }
+
+    // restart the operation timer
     emit startOperationTimerSignal();
 }
 
-void DownloadThread::onFileChunkSlot(quint32 chunkNumber, quint32 bytes, QByteArray chunk)
+void DownloadThread::onFileChunkSlot(quint32 chunkNumber, quint32 bytes, QByteArray chunk, quint32 serverChecksum)
 {
     LOCK;
-    //If the number of bytes is empty, something went wrong
+    
+    // Si el número de bytes es cero, algo falló en el servidor
     if( bytes == 0 )
     {
-        DBGLOG << "The server said the file can't be downloaded mid download.";
+        DBGLOG << "El servidor indicó un fallo mid-download.";
         emit stopOperationTimerSignal();
-        emit abortedSignal( "Something went wrong on the server side." );
+        emit abortedSignal( "Algo salió mal en el lado del servidor." );
         cleanup();
         return;
     }
 
-    //restart the operation timer
+    // Reiniciar el temporizador de operación
     emit startOperationTimerSignal();
 
+    // 1. Calcular el FNV-1a local para el bloque recibido
+    quint32 localChecksum = calculateFNV1a32(chunk.constData(), chunk.size());
 
-    //Otherwise we need to write this to the disk
-    m_CurrentChunk = chunkNumber;
-    if( chunk.size() )
-    {
-        m_LocalFile.write( chunk );
+    // 2. Validar integridad si el servidor envía un checksum válido (!= 0)
+    if (serverChecksum != 0 && localChecksum != serverChecksum) {
+        DBGLOG << "¡Error de integridad en el chunk " << chunkNumber 
+               << "! Local: 0x" << QString::number(localChecksum, 16) 
+               << " vs Servidor: 0x" << QString::number(serverChecksum, 16);
+
+        // Control de reintentos para este chunk
+        if (m_ChunkRetryCount < MAX_CHUNK_RETRIES) {
+            m_ChunkRetryCount++;
+            DBGLOG << "Reintentando chunk " << chunkNumber << " (Intento " << m_ChunkRetryCount << " de " << MAX_CHUNK_RETRIES << ")...";
+
+            // Solicitar de nuevo el archivo/bloque al servidor
+            ProtocolMessage_FilePull_t *retryRequest = AllocMessage<ProtocolMessage_FilePull_t>();
+            retryRequest->header.token = MAGIC_TOKEN;
+            retryRequest->header.type = PMT_GET_FILE;
+            char encodedPath[ MAX_FILEPATH_LENGTH ];
+            convertFromUTF8ToAmigaTextEncoding( m_RemoteFilePath, encodedPath, sizeof( encodedPath ) );
+            strncpy( retryRequest->filePath, encodedPath, strlen( encodedPath ) + 1 );
+            retryRequest->filePath[ strlen( encodedPath ) ] = 0;
+
+            emit sendAndReleaseMessageSignal(reinterpret_cast<ProtocolMessage_t*>(retryRequest));
+            return; // Salimos sin avanzar ni escribir datos corruptos
+        } else {
+            // Se agotaron los reintentos permitidos
+            DBGLOG << "Se superó el límite de reintentos para el chunk " << chunkNumber;
+            emit stopOperationTimerSignal();
+            emit abortedSignal("Error crítico de integridad: Falla persistente en el checksum FNV-1a.");
+            cleanup();
+            return;
+        }
     }
 
-    //Update the progress
+    // El chunk es íntegro y correcto: reseteamos el contador de reintentos
+    m_ChunkRetryCount = 0;
+
+    #if DEBUG
+    DBGLOG << "Chunk " << chunkNumber << " - Bytes: " << bytes << " - FNV-1a OK: 0x" << QString::number(localChecksum, 16);
+    #endif
+
+    // 3. Escribir los datos en el disco local con validación de E/S
+    m_CurrentChunk = chunkNumber;
+    if( !chunk.isEmpty() )
+    {
+        qint64 bytesWritten = m_LocalFile.write( chunk );
+        if( bytesWritten != chunk.size() )
+        {
+            DBGLOG << "Error escribiendo en disco: " << m_LocalFile.errorString();
+            emit stopOperationTimerSignal();
+            emit abortedSignal( "Error de E/S al escribir en el disco local." );
+            cleanup();
+            return;
+        }
+    }
+
+    // 4. Actualizar el progreso de la descarga
     m_ProgressBytes += bytes;
     if( m_FileSize > 0 )
     {
         m_ProgressProcent = m_ProgressBytes * 100 / m_FileSize;
-    }else
-    {
+    } else {
         m_ProgressProcent = 100;
     }
 
-    //Emit the progress
     emit downloadProgressSignal( m_ProgressProcent, m_ProgressBytes, m_ThroughPut );
 
-    //Are we done?
-    if( m_CurrentChunk == ( m_FileChunks - 1 ) )
+    // 5. Comprobar si hemos completado la descarga
+    if( m_CurrentChunk >= ( m_FileChunks - 1 ) )
     {
         cleanup();
         emit downloadCompletedSignal();

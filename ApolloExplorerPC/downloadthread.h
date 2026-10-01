@@ -59,7 +59,10 @@ public slots:
     void onOutgoingBytesUpdateSlot( quint32 bytes );
     void onAcknowledgeSlot( quint8 responseCode );
     void onStartOfFileSendSlot( quint64 fileSize, quint32 numberOfChunks, QString filename );
-    void onFileChunkSlot( quint32 chunkNumber, quint32 bytes, QByteArray chunk );
+    
+    // Slot actualizado con el checksum FNV-1a del servidor
+    void onFileChunkSlot( quint32 chunkNumber, quint32 bytes, QByteArray chunk, quint32 serverChecksum );
+    
     void onThroughputTimerExpiredSlot();
     void onDirectoryListingSlot( QSharedPointer<DirectoryListing> listing );
 
@@ -107,6 +110,11 @@ private:
     quint8 m_ProgressProcent;
     quint64 m_FileChunks;
     quint64 m_CurrentChunk;
+
+    // Variables de control para la retransmisión y validación de chunks
+    quint8 m_ChunkRetryCount = 0;
+    const quint8 MAX_CHUNK_RETRIES = 3;
+
     QAtomicInteger<quint64> m_BytesSentThisSecond;
     QAtomicInteger<quint64> m_BytesReceivedThisSecond;
     QAtomicInteger<quint64> m_ThroughPut;

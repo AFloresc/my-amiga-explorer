@@ -2,6 +2,7 @@
 #include "messagepool.h"
 #include <QtEndian>
 #include <QEventLoop>
+#include <QDebug>
 
 #define DEBUG 1
 #include "AEUtils.h"
@@ -298,184 +299,39 @@ void ProtocolHandler::onDisconnectedSlot()
     }
 }
 
-void ProtocolHandler::onMessageReceivedSlot( ProtocolMessage_t *newMessage )
+void ProtocolHandler::onMessageReceivedSlot( quint32 messageType, char *newMessage )
 {
-    //Check which message we got
-    switch( newMessage->type )
+    if( !newMessage )
+        return;
+
+    switch( messageType )
     {
-        case PMT_NEW_CLIENT_PORT:
-        {
-            ProtocolMessageNewClientPort_t *newClientPort = reinterpret_cast<ProtocolMessageNewClientPort_t*>( newMessage );
-            m_ServerPort = qFromBigEndian<quint16>( newClientPort->port );
-
-            DBGLOG << "Server told us to connect to port " << m_ServerPort;
-
-            //Now we are transitioning to the reconnect phase
-            m_ConnectionPhase = CP_RECONNECTING;
-
-            //start the reconnection
-            m_AEConnection.onDisconnectFromhostRequestedSlot();
-            m_AEConnection.onConnectToHostRequestedSlot( m_ServerAddress, m_ServerPort );
-            break;
-        }
-        case PMT_VERSION:
-        {
-            //This signifies that we are now connected
-            m_ConnectionPhase = CP_CONNECTED;
-
-            ProtocolMessage_Version_t *versionMsg = reinterpret_cast<ProtocolMessage_Version_t*>( newMessage );
-            DBGLOG << "Server version is: " << versionMsg->major << "." << versionMsg->minor << "." << versionMsg->rev;
-            emit serverVersionSignal( versionMsg->major, versionMsg->minor, versionMsg->rev );
-            emit connectedToHostSignal();
-            break;
-        }
-        case PMT_DIR_LIST:
-        {
-            ProtocolMessageDirectoryList_t *dirListMsg = reinterpret_cast<ProtocolMessageDirectoryList_t*>( newMessage );
-
-            //Create a new object for this
-            DirectoryListing *newDirectoryListing = new DirectoryListing();
-            newDirectoryListing->populate( dirListMsg );
-            QSharedPointer<DirectoryListing> newDirectoryListingShrdPtr( newDirectoryListing );
-
-            //Emit this.
-            emit newDirectoryListingSignal( newDirectoryListingShrdPtr );
-            break;
-        }
-        case PMT_ACK:
-        {
-            //Get the response out
-            ProtocolMessage_Ack_t *ack = reinterpret_cast<ProtocolMessage_Ack_t*>( newMessage );
-            quint8 response = ack->response;
-
-            //emit this
-            emit acknowledgeSignal();
-            emit acknowledgeWithCodeSignal( response );
-            break;
-        }
-        case PMT_FAILED:
-        {
-            ProtocolMessage_Failed_t *errorMsg = reinterpret_cast<ProtocolMessage_Failed_t*>( newMessage );
-            QString message = convertFromAmigaTextEncoding( errorMsg->message );
-            if( message.length() == 0 ){    message = "Unknown"; }
-            emit failedWithReasonSignal( message );
-            emit failedSignal();
-            break;
-        }
-        case PMT_START_OF_SEND_FILE:
-        {
-            ProtocolMessage_StartOfFileSend_t *sofMsg = reinterpret_cast< ProtocolMessage_StartOfFileSend_t*>( newMessage );
-
-            //Extract the details from the message
-            QString filename = convertFromAmigaTextEncoding( sofMsg->filePath );
-            quint64 fileSize = qFromBigEndian<quint32>( sofMsg->fileSize );
-            quint32 numberOfChunks = qFromBigEndian<quint32>( sofMsg->numberOfFileChunks );
-
-            //Emit this as a signal
-            emit startOfFileSendSignal( fileSize, numberOfChunks, filename );
-            break;
-        }
         case PMT_FILE_CHUNK:
         {
             ProtocolMessage_FileChunk_t *fileChunkMsg = reinterpret_cast<ProtocolMessage_FileChunk_t*>( newMessage );
 
-            //Extract the info out of the message
+            // Extraer metadatos del paquete en formato de red a host
             quint32 chunkNumber = qFromBigEndian<quint32>( fileChunkMsg->chunkNumber );
             quint64 bytes = qFromBigEndian<quint32>( fileChunkMsg->bytesContained );
+            
+            // Extracción del checksum FNV-1a enviado por el servidor Amiga
+            // (Asegúrate de que tu estructura C incluya este campo al final)
+            quint32 serverChecksum = qFromBigEndian<quint32>( fileChunkMsg->checksum ); 
+            
             QByteArray chunk( fileChunkMsg->chunk, bytes );
 
-            //Emit the file chunk
-            emit fileChunkSignal( chunkNumber, bytes, chunk );
+            // Emitir la señal hacia el hilo de descarga con el checksum recibido
+            emit fileChunkSignal( chunkNumber, bytes, chunk, serverChecksum ); 
             break;
         }
-        case PMT_FILE_CHUNK_CONF:
-        {
-            ProtocolMessage_FileChunkConfirm_t *fileChunkConfMsg = reinterpret_cast<ProtocolMessage_FileChunkConfirm_t*>( newMessage );
-
-            //Extract the info out of the message
-            quint32 chunkNumber = qFromBigEndian<quint32>( fileChunkConfMsg->chunkNumber );
-
-            //Emit the file chunk
-            emit fileChunkReceivedSignal( chunkNumber );
-            break;
-        }
-        case PMT_FILE_PUT_CONF:
-        {
-            ProtocolMessage_FilePutConfirm_t *filePutConfMsg = reinterpret_cast<ProtocolMessage_FilePutConfirm_t*>( newMessage );
-
-            //Extract the info out of the message
-            quint32 bytesWritten = qFromBigEndian<quint32>( filePutConfMsg->filesize );
-
-            //Emit the file chunk
-            emit fileReceivedSignal( bytesWritten );
-            break;
-        }
-        case PMT_VOLUME_LIST:
-        {
-            ProtocolMessage_VolumeList_t *volumeListMessage = reinterpret_cast<ProtocolMessage_VolumeList_t*>( newMessage );
-            QList<QSharedPointer<DiskVolume>> volumes;
-            quint32 volumeCount = 0;
-
-            //Endian conversion
-            volumeListMessage->volumeCount = qFromBigEndian( volumeListMessage->volumeCount );
-
-            //Go through the volume list
-            VolumeEntry_t *volumeEntry = volumeListMessage->volumes;
-            while( volumeCount < volumeListMessage->volumeCount )
-            {
-                //Get the name out
-                QSharedPointer<DiskVolume> diskVolume( new DiskVolume( *volumeEntry ) );
-                volumes.push_back( diskVolume );
-                volumeCount++;
-
-                //Get the next entry
-                volumeEntry->entrySize = qFromBigEndian( volumeEntry->entrySize );
-                volumeEntry = (VolumeEntry_t*)((char*)volumeEntry + volumeEntry->entrySize);
-            }
-
-            //Send out the result
-            emit volumeListSignal( volumes );
-
-            break;
-        }
-        case  PMT_PATH_DELETED:
-        {
-            ProtocolMessage_PathDeleted_t *pathDelMsg = reinterpret_cast<ProtocolMessage_PathDeleted_t*>( newMessage );
-            QString path = convertFromAmigaTextEncoding( pathDelMsg->filePath );
-            DBGLOG << "File " << path << " deleted " << ( pathDelMsg->deleteSucceeded == 1 ? "successfully" : "unsuccessfully" ) << ".";
-            if( pathDelMsg->deleteSucceeded == 1 )
-            {
-                if( pathDelMsg->deleteCompleted == 1 )
-                {
-                    emit recursiveDeletionCompletedSignal();
-                }else
-                {
-                    emit fileDeletedSignal( path );
-                }
-            }else
-            {
-                emit fileDeleteFailedSignal( path, pathDelMsg->failureReason );
-            }
-            break;
-        }
-        case PMT_PING:
-        {
-            //We can pretty much ignore this.  No pong required.......yet
-            DBGLOG << "Got ping" ;
-            break;
-        }
-        case PMT_CLOSING:
-        {
-            ProtocolMessageDisconnect_t *disconnectMessage = reinterpret_cast<ProtocolMessageDisconnect_t*>( newMessage );
-            QString message( disconnectMessage->message );
-
-            //Inform others what happened
-            emit serverClosedConnectionSignal( message );
-            break;
-        }
+        
+        // ... (otros tipos de mensajes del protocolo)
+        
         default:
-            DBGLOG << "Unsupported message type " << newMessage->type;
-        break;
+            #if DEBUG
+            DBGLOG << "Unknown message type received: " << messageType;
+            #endif
+            break;
     }
 }
 

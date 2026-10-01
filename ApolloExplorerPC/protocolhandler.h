@@ -87,7 +87,10 @@ signals:
     void failedWithReasonSignal( QString reason );
     void failedSignal();
     void startOfFileSendSignal( quint64 fileSize, quint32 numberOfChunks, QString filename );
-    void fileChunkSignal( quint32 chunkNumber, quint32 bytes, QByteArray chunk );
+    
+    // Señal actualizada para incluir el checksum FNV-1a del servidor
+    void fileChunkSignal( quint32 chunkNumber, quint32 bytes, QByteArray chunk, quint32 serverChecksum );
+    
     void volumeListSignal( QList<QSharedPointer<DiskVolume>> volumes );
     void fileChunkReceivedSignal( quint32 chunkNumber );
     void fileReceivedSignal( quint32 bytesWrittenToDisk );
