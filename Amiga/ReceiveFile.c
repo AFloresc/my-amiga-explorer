@@ -168,3 +168,26 @@ void cleanupFileReceive()
 	g_TotalChunks = 0;
 	memset( g_FilePath, 0, sizeof( g_FilePath ) );
 }
+
+void abortFileReceive(void)
+{
+    dbglog("[abortFileReceive] Abortando recepción y eliminando archivo incompleto '%s'.\n", g_FilePath);
+
+    if (g_FileHandle)
+    {
+        Close(g_FileHandle);
+        g_FileHandle = (BPTR)NULL;
+    }
+
+    /* Eliminar el archivo parcial de la ruta */
+    if (g_FilePath[0] != '\0')
+    {
+        DeleteFile(g_FilePath);
+    }
+
+    /* Limpiar variables globales */
+    g_FileSize = 0;
+    g_CurrentChunk = 0;
+    g_TotalChunks = 0;
+    memset(g_FilePath, 0, sizeof(g_FilePath));
+}
